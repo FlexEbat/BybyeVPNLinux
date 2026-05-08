@@ -76,6 +76,5 @@ sudo ./env/bin/python3 byebyevpnlinux.py scan 8.8.8.8 --save
 # Проверить свою машину на наличие локальных признаков VPN
 sudo ./env/bin/python3 byebyevpnlinux.py local
 ```
-```
 
 ---
