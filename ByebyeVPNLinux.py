@@ -274,7 +274,6 @@ async def service_fuzzer(ip, open_ports):
         log.p(f"  -> Testing port :{p}")
         printed_info = False
 
-        # HTTP Proxy check
         try:
             r, w = await asyncio.wait_for(asyncio.open_connection(ip, p), timeout=1.5)
             w.write(b"CONNECT 8.8.8.8:443 HTTP/1.1\r\nHost: 8.8.8.8:443\r\n\r\n"); await w.drain()
@@ -286,7 +285,6 @@ async def service_fuzzer(ip, open_ports):
             w.close()
         except: pass
 
-        # HTTP Header Leak check
         if p in (80, 8080):
             resp = await raw_http_get(ip, "/", p, is_tls=False)
             if resp:
@@ -296,7 +294,6 @@ async def service_fuzzer(ip, open_ports):
                     proxy_headers_leak = True
                     printed_info = True
 
-        # TLS / uTLS check
         if p in (443, 8443):
             try:
                 cert_pem = ssl.get_server_certificate((ip, p), timeout=2)
@@ -314,9 +311,7 @@ async def service_fuzzer(ip, open_ports):
                 log.p(f"     TLS cert: failed to extract", YELLOW)
                 printed_info = True
 
-            # Basic uTLS dual-probe emulation (OpenSSL vs Chrome CH)
             try:
-                # OpenSSL handshake
                 ctx = ssl.create_default_context()
                 ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
                 r1, w1 = await asyncio.wait_for(asyncio.open_connection(ip, p, ssl=ctx), timeout=2)
@@ -325,7 +320,6 @@ async def service_fuzzer(ip, open_ports):
             except: ssl_success = False
 
             try:
-                # Chrome emulation
                 resp = urequests.get(f"https://{ip}:{p}", impersonate="chrome131", verify=False, timeout=2)
                 chr_success = True
             except: chr_success = False
@@ -382,10 +376,8 @@ async def j3_probes(ip, open_ports):
             except:
                 log.p(f"    SILENT {name:<18} empty/close (dropped)")
 
-        # Анализ на Canned Fallback
         if len(responses) >= 2:
             first_lines =[r.split(b'\r\n')[0] for r in responses if b'\r\n' in r]
-            # Если на разный мусор сервер отвечает абсолютно идентичной первой строкой (и это не дроп)
             if len(first_lines) > 2 and first_lines.count(first_lines[0]) >= 2:
                 if b"HTTP/1." in first_lines[0]:
                     canned_fallback = True
@@ -400,7 +392,6 @@ def run_trace(ip, t_lat, t_lon, own_lat, own_lon, min_rtt):
     log.p(f"[{GREEN}Norm: RTT > Speed of light | Clean routing{RESET}]")
     log.p(f"[{RED}Alert: RTT < Speed of light (Anycast bypass) | TSPU subnets (10.X.Y.Z) on path{RESET}]")
 
-    # 1. Считаем физику
     dist_km = haversine(own_lat, own_lon, t_lat, t_lon)
     theoretical_min_rtt = dist_km * 0.01 * 1.2
 
@@ -415,7 +406,6 @@ def run_trace(ip, t_lat, t_lon, own_lat, own_lon, min_rtt):
     else:
         log.p(f"RTT is consistent with physical geolocation.", GREEN)
 
-    # 2. Настоящий Traceroute через scapy
     log.p("\nTraceroute (ICMP):")
     ttl = 1
     max_hops = 20
@@ -434,7 +424,7 @@ def run_trace(ip, t_lat, t_lon, own_lat, own_lon, min_rtt):
                 if len(parts) == 4 and int(parts[3]) in range(131, 255):
                     tspu_hop_detected = True
 
-            if reply.type == 0:  # Echo Reply (Target Reached)
+            if reply.type == 0:
                 break
         ttl += 1
 
@@ -444,7 +434,17 @@ def run_trace(ip, t_lat, t_lon, own_lat, own_lon, min_rtt):
     return snitch_viol, tspu_hop_detected
 
 async def main():
-    log.p("=== ByebyeVPNLinux: Full TSPU/DPI/VPN detectability scanner v2.6.0 ===", MAGENTA)
+    log.p(r" /$$$$$$$                      /$$$$$$$                      /$$    /$$                    /$$       /$$                              ", MAGENTA)
+    log.p(r"| $$__  $$                    | $$__  $$                    | $$   | $$                   | $$      |__/                              ", MAGENTA)
+    log.p(r"| $$  \ $$ /$$   /$$  /$$$$$$ | $$  \ $$ /$$   /$$  /$$$$$$ | $$   | $$ /$$$$$$  /$$$$$$$ | $$       /$$ /$$$$$$$  /$$   /$$ /$$   /$$", MAGENTA)
+    log.p(r"| $$$$$$$ | $$  | $$ /$$__  $$| $$$$$$$ | $$  | $$ /$$__  $$|  $$ / $$//$$__  $$| $$__  $$| $$      | $$| $$__  $$| $$  | $$|  $$ /$$/", MAGENTA)
+    log.p(r"| $$__  $$| $$  | $$| $$$$$$$$| $$__  $$| $$  | $$| $$$$$$$$ \  $$ $$/| $$  \ $$| $$  \ $$| $$      | $$| $$  \ $$| $$  | $$ \  $$$$/ ", MAGENTA)
+    log.p(r"| $$  \ $$| $$  | $$| $$_____/| $$  \ $$| $$  | $$| $$_____/  \  $$$/ | $$  | $$| $$  | $$| $$      | $$| $$  | $$| $$  | $$  >$$  $$ ", MAGENTA)
+    log.p(r"| $$$$$$$/|  $$$$$$$|  $$$$$$$| $$$$$$$/|  $$$$$$$|  $$$$$$$   \  $/  | $$$$$$$/| $$  | $$| $$$$$$$$| $$| $$  | $$|  $$$$$$/ /$$/\  $$", MAGENTA)
+    log.p(r"|_______/  \____  $$ \_______/|_______/  \____  $$ \_______/    \_/   | $$____/ |__/  |__/|________/|__/|__/  |__/ \______/ |__/  \__/", MAGENTA)
+    log.p(r"           /$$  | $$                     /$$  | $$                    | $$                                                            ", MAGENTA)
+    log.p(r"          |  $$$$$$/                    |  $$$$$$/                    | $$                                                            ", MAGENTA)
+    log.p(r"           \______/                      \______/                     |__/                                                            ", MAGENTA)
 
     if os.geteuid() != 0:
         print(f"{RED}CRITICAL ERROR: Run the script via 'sudo' for ICMP Traceroute.{RESET}")
@@ -469,7 +469,6 @@ async def main():
     log.p(f"\n[1/8] DNS resolve", CYAN)
     log.p(f"{host} -> {ip}[v4, {dt}ms]", GREEN)
 
-    # Запускаем все проверки по-настоящему
     is_hosting, t_lat, t_lon, own_lat, own_lon = await geoip_aggregation(ip)
 
     ports_to_scan =[21, 22, 53, 80, 443, 1194, 3389, 8080, 8443] if args.fast else list(range(1, 65536))
@@ -482,14 +481,12 @@ async def main():
     min_rtt = min(rtts) if rtts else 0
     snitch_viol, tspu_hop_detected = run_trace(ip, t_lat, t_lon, own_lat, own_lon, min_rtt)
 
-    # === ФОРМИРОВАНИЕ ИТОГОВОЙ МАТРИЦЫ DPI ===
     log.p("\n[8/8] Verdict\n", CYAN)
 
     strong_signals =[]
     soft_signals =[]
     info_signals =[]
 
-    # Анализ сигналов
     if canned_fallback:
         strong_signals.append("Port returns a canned fallback page (identical HTTP first-line for different raw-TCP junk). Classic Xray/Trojan fallback signature.")
     if has_http_proxy:
@@ -519,9 +516,9 @@ async def main():
     if 22 in open_ports:
         info_signals.append("Port 22 (SSH) is open.")
 
-    # Рассчет DPI Матрицы
+
     dp_ports = "HIGH" if udp_detected else "LOW"
-    dp_cert = "HIGH" if (cert_info.get('cn') != 'Unknown' and not is_hosting) else "NONE" # Очень упрощенная логика
+    dp_cert = "HIGH" if (cert_info.get('cn') != 'Unknown' and not is_hosting) else "NONE"
     dp_j3 = "HIGH" if canned_fallback else "LOW"
     dp_asn = "HIGH" if is_hosting else "LOW"
 
@@ -547,7 +544,6 @@ async def main():
         for s in info_signals: log.p(f"  [i] {s}")
         log.p("")
 
-    # Подсчет финального скора
     score = 100
     score -= len(strong_signals) * 25
     score -= len(soft_signals) * 10
