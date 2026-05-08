@@ -1,4 +1,4 @@
-# 🕵️ ByebyeVPNLinux (Full TSPU/DPI/VPN Detectability Scanner)
+# ByebyeVPNLinux (Full TSPU/DPI/VPN Detectability Scanner)
 
 🌍 **[English](#english)** | 🇷🇺 **[Русский](#русский)**
 
@@ -7,7 +7,7 @@
 <a id="english"></a>
 ## 🇬🇧 English
 
-> **Note:** This project is a Linux fork of the original [BybyeVPN](https://github.com/FlexEbat/BybyeVPN) tool. It has been adapted and extended for Linux environments, utilizing raw sockets, `scapy` for accurate network tracing, and `curl_cffi` for advanced TLS fingerprinting.
+> **Note:** This project is a Linux fork of the original [BybyeVPN](https://github.com/pwnnex/ByeByeVPN) tool. It has been adapted and extended for Linux environments, utilizing raw sockets, `scapy` for accurate network tracing, and `curl_cffi` for advanced TLS fingerprinting.
 
 ### 📌 Overview
 **ByebyeVPNLinux** is an advanced network analysis and penetration testing tool designed to evaluate the detectability of VPNs, Proxies, and circumvention tools (like Xray, Trojan, Shadowsocks, WireGuard, Amnezia, etc.) against Deep Packet Inspection (DPI) systems, specifically emulating the logic of the Russian TSPU (ТСПУ) middleboxes.
@@ -62,7 +62,7 @@ This tool requires **Linux** and root privileges (for Scapy raw sockets).
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/ByebyeVPNLinux.git
+git clone https://github.com/FlexEbat/BybyeVPNLinux.git
 cd ByebyeVPNLinux
 
 # Create a virtual environment (Recommended)
@@ -90,7 +90,7 @@ sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --fast
 <a id="русский"></a>
 ## 🇷🇺 Русский
 
-> **Примечание:** Этот проект является Linux-форком оригинальной утилиты [BybyeVPN](https://github.com/FlexEbat/BybyeVPN). Он был адаптирован и расширен для работы в Linux с использованием сырых сокетов, библиотеки `scapy` для точной трассировки сети и `curl_cffi` для продвинутого фингерпринтинга TLS.
+> **Примечание:** Этот проект является Linux-форком оригинальной утилиты [BybyeVPN](https://github.com/pwnnex/ByeByeVPN). Он был адаптирован и расширен для работы в Linux с использованием сырых сокетов, библиотеки `scapy` для точной трассировки сети и `curl_cffi` для продвинутого фингерпринтинга TLS.
 
 ### 📌 Обзор
 **ByebyeVPNLinux** — это продвинутый инструмент для сетевого анализа и пентеста, созданный для оценки «заметности» VPN-туннелей, прокси и средств обхода блокировок (Xray, Trojan, Shadowsocks, WireGuard, Amnezia и др.) для систем глубокого анализа пакетов (DPI). Скрипт эмулирует логику работы российских комплексов ТСПУ.
@@ -145,7 +145,7 @@ sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --fast
 
 ```bash
 # Клонируем репозиторий
-git clone https://github.com/ВАШ_USERNAME/ByebyeVPNLinux.git
+git clone https://github.com/FlexEbat/BybyeVPNLinux.git
 cd ByebyeVPNLinux
 
 # Создаем виртуальное окружение (Рекомендуется)
