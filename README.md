@@ -28,9 +28,54 @@
 ### Installation (via Virtual Environment)
 It is highly recommended to install the dependencies inside a `venv` to avoid conflicting with your system's Python packages.
 
+---
+
+## Русский
+
+### Что это?
+**BybyeVPNLinux** — это полнофункциональный анализатор для выявления VPN, прокси и XTLS/Reality под ОС Linux. Он эмулирует системы ТСПУ (DPI) и проводит глубокий сетевой анализ, чтобы выяснить, является ли указанный IP-адрес VPN-сервером, прокси или обычным дата-центром.
+
+### Особенности
+* **Консенсус GeoIP:** Опрашивает 9 независимых баз данных IP-разведки для перекрестной проверки ASN и принадлежности к хостингам.
+* **Отпечаток TCP стека (Fingerprint):** Выявляет аномалии размера окна TCP MSS, характерные для туннелей (WireGuard/OpenVPN).
+* **UDP Пробы (Реальные хендшейки):** Отправляет настоящие handshake для WireGuard, OpenVPN, IKEv2, QUIC, Tailscale, Hysteria2, AmneziaWG (включая двойную пробу для Sx=8).
+* **J3 Active Probing:** Отправляет 8 различных пакетов на TLS порты (включая .invalid SNI и пустой TCP), выявляя логику глухой защиты XTLS/Reality.
+* **Детект сервисов:** Находит открытые SOCKS5, HTTP CONNECT Proxy, Microsoft SSTP и утечки HTTP-заголовков (`X-Forwarded-For`, `Via`).
+* **SNITCH (Проверка скоростью света):** Сравнивает физическое расстояние между вами и сервером с реальным TCP RTT для выявления невозможных скоростей (Anycast/WARP).
+* **Локальный аудит (Команда `local`):** Сканирует саму машину Linux на наличие виртуальных интерфейсов (`tun0`, `wg0`), аномалий маршрутизации (split-tunneling) и использования утилит вроде `proxychains` / `tsocks`.
+
+### Требования
+* ОС Linux
+* Python 3.8+
+* Права `sudo` (необходимы для ICMP трассировки, чтения `/proc/net/dev` и сырого TCP-анализа).
+
+### Установка (через venv)
+Крайне рекомендуется устанавливать зависимости в виртуальное окружение, чтобы не сломать системный Python.
+
 ```bash
 git clone https://github.com/YOUR_USER/BybyeVPNLinux.git
 cd BybyeVPNLinux
 python3 -m venv env
 source env/bin/activate
 pip install scapy curl_cffi
+```
+
+### Как использовать
+Запускайте скрипт с правами `sudo`, указывая путь к Python внутри созданного `venv`:
+
+```bash
+# Интерактивное меню
+sudo ./env/bin/python3 byebyevpnlinux.py
+
+# Полный серверный скан целевого IP
+sudo ./env/bin/python3 byebyevpnlinux.py scan 8.8.8.8
+
+# Сохранить отчет о сканировании в Markdown-файл
+sudo ./env/bin/python3 byebyevpnlinux.py scan 8.8.8.8 --save
+
+# Проверить свою машину на наличие локальных признаков VPN
+sudo ./env/bin/python3 byebyevpnlinux.py local
+```
+```
+
+---
