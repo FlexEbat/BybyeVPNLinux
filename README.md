@@ -203,4 +203,5 @@ sudo ./env/bin/python3 byebyevpnlinux.py <IP_ИЛИ_ДОМЕН> --compare <IP_И
 ---
 ⚠️ **Disclaimer / Отказ от ответственности:**  
 *This tool is intended for educational purposes, network defense analysis, and evaluating the OPSEC of your own servers. The author is not responsible for any misuse.*
+
 *Инструмент предназначен исключительно для образовательных целей, анализа защиты сетей и проверки OPSEC собственных серверов. Автор не несет ответственности за любое неправомерное использование.*
