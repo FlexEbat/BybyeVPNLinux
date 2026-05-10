@@ -1,193 +1,198 @@
+
+
+
+
 # ByebyeVPNLinux
 
-🌍 **[English](#english)** | 🇷🇺 **[Русский](#русский)**
+**[English](#english)** | **[Русский](#русский)**
 
 ---
 
 <a id="english"></a>
-## 🇬🇧 English
+## English
 
-> **Note:** This project is a Linux fork of the original [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN) tool. It has been heavily adapted and extended for Linux environments, utilizing raw sockets, `scapy` for stealth scanning and accurate network tracing, and `curl_cffi` for advanced TLS fingerprinting.
+**Note:** This project is a Linux fork of the original [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN) tool. It has been fundamentally rewritten for Linux environments to utilize raw sockets, the `scapy` library for precise network-level manipulation, and `curl_cffi` for accurate TLS fingerprint spoofing.
 
-### 📌 Overview
-**ByebyeVPNLinux** is an enterprise-grade network analysis and penetration testing tool designed to evaluate the detectability of VPNs, Proxies, and circumvention tools (like Xray, Trojan, Shadowsocks, WireGuard, Amnezia, etc.) against Deep Packet Inspection (DPI) systems. It specifically emulates the logic of Russian TSPU (ТСПУ) and the Great Firewall of China (GFW).
+### Overview
 
-It scans a target IP or domain, runs a massive battery of L3-L7 active and passive network probes, and calculates a "DPI Exposure Score" to determine how obvious your VPN tunnel is to a passive network observer or active censor.
+ByebyeVPNLinux is a low-level network diagnostic and penetration testing toolkit. Its primary purpose is to evaluate the operational security (OPSEC) and detectability of circumvention protocols, proxies, and VPNs (Xray, Trojan, Shadowsocks, WireGuard, AmneziaWG, etc.) against passive and active Deep Packet Inspection (DPI) systems. 
 
-### ⚙️ Core Checking Strategies & How They Work
+The tool closely emulates the heuristic algorithms and active probing mechanisms deployed by state-level middleboxes, specifically the Russian TSPU (Technical Means of Threat Counteraction) and the Great Firewall of China (GFW). It calculates a DPI Exposure Score based on RFC violations, cryptographic anomalies, timing attacks, and physical routing inconsistencies.
 
-The scanner performs 8 distinct phases of deep analysis:
+### Core Checking Strategies & Technical Mechanics
+
+The scanner executes eight distinct phases of deep analysis, shifting from Layer 3 (Network) up to Layer 7 (Application).
 
 #### 1. DNS Resolution
-Resolves the target domain to an IPv4 address to establish the primary testing target.
+Before initiating TCP/UDP flows, the tool resolves the target domain to an IPv4 address. This establishes the baseline IP for all subsequent direct-to-IP routing tests, bypassing local DNS caching or DNS-over-HTTPS configurations that might obscure the actual endpoint.
 
-#### 2. GeoIP, BGP & OSINT (Parallel Lookup)
-*   **GeoIP & ASN:** Queries 7 providers concurrently. If the ASN belongs to a Datacenter or Cloud provider (Hetzner, AWS, etc.), it flags the IP as `HOSTING`. DPI systems use this as a primary pre-filter.
-*   **BGP Prefix:** Extracts routing prefixes to determine ASN legitimacy.
-*   **Reverse DNS (PTR):** Checks if the IP has a valid PTR record. A missing PTR or a mismatch with the TLS domain is a classic signature of "grey" proxy infrastructure.
+#### 2. GeoIP, BGP Routing & OSINT (Parallel Verification)
+DPI systems use Autonomous System Number (ASN) databases as the first layer of traffic classification. 
+*   **ASN Profiling:** The tool queries multiple GeoIP databases simultaneously. If the IP resolves to a commercial datacenter or cloud provider (e.g., Hetzner, DigitalOcean, AWS), it is flagged. State censors inherently distrust traffic flowing to commercial ASNs compared to residential or mobile ISPs.
+*   **BGP Routing Analysis:** Extracts BGP prefixes to verify if the routing advertisement aligns with the claimed ASN, identifying potential BGP hijacking or bulletproof hosting anomalies.
+*   **Reverse DNS (PTR):** A legitimate web server usually has a PTR record that matches its TLS domain. Proxy servers often lack PTR records entirely or resolve to default generic hostnames (e.g., `vps-12345.hoster.com`). A mismatch here is a strong indicator of "grey" infrastructure.
 
 #### 3. TCP Stealth SYN-scan & L3 Profiling
-*   **Stealth SYN Scan (Scapy):** Performs a fast, half-open TCP scan that leaves minimal logs on the target server.
-*   **Path MTU Discovery (PMTUD):** Sends ICMP packets with the `DF` (Don't Fragment) flag at varying sizes (1500 to 1380). If the connection MTU is `< 1500` (e.g., 1420), it mathematically proves the presence of VPN encapsulation overhead.
-*   **TTL Tracking:** Compares the Time-To-Live (TTL) of packets returning from open vs. closed ports. A TTL difference `> 2` strongly indicates a Middlebox/TSPU is actively injecting packets into the stream.
-*   **OS Fingerprinting:** Guesses the target OS based on the TCP Receive Window size (p0f style).
+Instead of standard OS-level `connect()` calls, which leave traces in the target's application logs, this phase constructs raw packets.
+*   **Stealth SYN Scan:** Uses `scapy` to send SYN packets. If a SYN-ACK is received, the tool immediately sends an RST packet to tear down the half-open connection without notifying the application layer.
+*   **Path MTU Discovery (PMTUD):** The standard Ethernet Maximum Transmission Unit is 1500 bytes. Tunneling protocols (WireGuard, IPsec) add headers, forcing the MTU down. The tool sends ICMP Echo Requests with the `DF` (Don't Fragment) flag set, incrementally reducing the payload size. If the maximum transmissible size is exactly 1420 or 1380 bytes, it mathematically proves the presence of VPN encapsulation on the route.
+*   **TTL Tracking & Middlebox Detection:** Analyzes the Time-To-Live (TTL) field of returning IP packets. If an open port responds with a TTL of 54, but a closed port responds with a TTL of 114, it proves that a Middlebox (like a TSPU DPI node) is intercepting the connection and injecting its own packets before they reach the actual server.
+*   **TCP Window Fingerprinting:** Reads the raw TCP Window size and MSS values from the SYN-ACK to fingerprint the underlying operating system kernel independently of the application layer.
 
 #### 4. UDP Probes & FakeDNS Detection
-*   **Real Handshakes:** Instead of dumb UDP port scanning, it sends **actual protocol initialization payloads** for WireGuard, AmneziaWG (Sx=8), OpenVPN, QUIC, TUIC v5, Hysteria2, L2TP, and IKEv2.
-*   **WireGuard Malformed Profiling:** Sends broken WG packets to determine if the protocol runs in the Kernel or in Userspace (`wireguard-go`).
-*   **FakeDNS Leak:** Sends a DNS query for a blocked domain. If the server returns a local IP (e.g., `198.18.x.x` or `10.x.x.x`), it exposes an active Xray/V2Ray FakeDNS routing module.
+Standard UDP port scanning relies on unreliable ICMP Destination Unreachable responses. This tool uses protocol-specific initiation payloads.
+*   **Deterministic Handshakes:** Sends exact initialization bytes for WireGuard, AmneziaWG (with specific Sx=8 magic headers), OpenVPN (HARD_RESET), QUIC, TUIC v5, Hysteria2, L2TP, and IKEv2. A valid response absolutely confirms the protocol's presence.
+*   **WireGuard Malformed Profiling:** Sends intentionally broken WireGuard MAC sequences. Kernel-space WireGuard ignores them silently; userspace implementations (like `wireguard-go`) often generate discernible error patterns or specific ICMP responses.
+*   **FakeDNS Leak Detection:** Proxy clients like V2Ray often hijack DNS requests, returning fake local IP addresses (e.g., 198.18.0.1) to internal clients to track connections. The tool sends a raw DNS query for a known blocked domain. If the server responds with a private IP range, the FakeDNS routing module is exposed.
 
-#### 5. Service, Web & Crypto Fingerprinting (L7)
-*   **uTLS Dual-Probe (Reality Discriminator):** Performs two TLS handshakes: one using standard `OpenSSL` and one spoofing `Chrome 131`. If the server drops one but accepts the other, it proves the server is analyzing the `ClientHello` (JA3/JA4 fingerprinting) — a hallmark of XTLS-Reality.
-*   **Certificate Transparency (CT Logs):** Queries `crt.sh`. If a valid certificate is missing from public CT logs (or was issued minutes ago), it flags a dynamically generated ShadowTLS/Reality certificate.
-*   **ALPN & Cert Validity:** Checks negotiated ALPNs (h2, http/1.1) and detects 10-year self-signed certificates (classic OpenVPN/Shadowsocks).
-*   **WebSocket Upgrade Anomaly:** Sends a fake WS upgrade request. Unusual responses (e.g., 400 Bad Request instead of 404) reveal V2Ray WS masking.
-*   **Timing Attacks (Slowloris):** Sends incomplete HTTP headers. Proxies abruptly close these connections (< 3s), while real web servers wait patiently.
-*   **Domain Fronting:** Sends one SNI but a different HTTP `Host` header. Misconfigured proxies will process it, whereas real CDNs will return `421 Misdirected Request`.
+#### 5. Service, Web & Cryptographic Fingerprinting (L7)
+*   **uTLS Dual-Probe (Reality Discriminator):** XTLS-Reality circumvents DPI by dropping connections that do not match specific TLS ClientHello fingerprints (like modern browsers). The tool initiates two TLS connections: one with a default OpenSSL fingerprint and one mimicking Chrome 131 using `curl_cffi`. If the server drops OpenSSL but accepts Chrome, the Reality discriminator is actively filtering traffic.
+*   **Certificate Transparency (CT) Validation:** Queries `crt.sh`. Legitimate Let's Encrypt or ZeroSSL certificates are logged in public CT databases. If a server presents a valid certificate that is missing from CT logs, it indicates the certificate is being dynamically spoofed in memory (a signature of ShadowTLS or XTLS-Reality).
+*   **ALPN & Long-term Certs:** Verifies Application-Layer Protocol Negotiation (ALPN). Additionally, checks the certificate's validity span. Self-signed certificates valid for 10 years are a classic signature of legacy Shadowsocks or OpenVPN setups.
+*   **Timing Attacks (Slowloris Variant):** Sends a partial HTTP GET request without the terminating `\r\n\r\n`. Standard web servers (Nginx/Apache) will wait up to 60 seconds for the request to complete. Proxy servers are configured to aggressively terminate stalled connections (often under 3 seconds) to prevent resource exhaustion attacks.
+*   **Domain Fronting Checks:** Sends a TLS ClientHello with a benign SNI, but sets the HTTP `Host` header to the actual target domain. Strict CDNs reject this with a 421 Misdirected Request. Misconfigured proxies process it blindly.
 
 #### 6. J3 / TSPU Active Probing & Replay Attacks
-*   **Canned Fallback Detect:** Sends raw TCP garbage, SSH banners, and `0xFF` bytes. If the server responds with the **exact same HTTP error** (e.g., identical 360-byte `400 Bad Request`) for different garbage, it is a guaranteed Xray/Trojan fallback signature.
-*   **Entropy Analysis:** Calculates the Shannon entropy of the server's response. Entropy `> 7.5` indicates highly obfuscated/encrypted garbage (VMess/Shadowsocks signature).
-*   **Replay Attacks:** Records a successful TLS ClientHello and sends it again in a new connection. If the server instantly drops the second connection, it proves Anti-Replay protection is active (Shadowsocks-AEAD / XTLS).
-*   **SS-AEAD Length Probe:** Sends exactly 50 bytes. Shadowsocks-AEAD servers will wait for the block to finish and immediately disconnect, revealing their presence.
-*   **HTTP/2 Profiling:** Sends raw H2 prefaces to detect non-standard proxy HTTP/2 implementations.
+DPI systems actively probe suspected proxy ports by sending garbage data to see how the server reacts.
+*   **Canned Fallback Detection:** The tool sends raw TCP garbage, SSH protocol banners, and `0xFF` bytes to the target port. Standard web servers will return different HTTP errors (or simply close the socket) depending on the input. Proxies (Xray/Trojan) route all unrecognized traffic to a static fallback handler. If the tool receives the exact same HTTP response (e.g., a mathematically identical 360-byte 400 Bad Request) for entirely different malformed payloads, it is a definitive proxy fallback signature.
+*   **Entropy Analysis:** Calculates the Shannon entropy of the server's response to random bytes. If the entropy exceeds 7.5 bits per byte, the response is heavily obfuscated or encrypted without standard protocol headers, which is a core signature of VMess or Shadowsocks.
+*   **Replay Attacks:** Records a valid TLS ClientHello packet and transmits it again in a new TCP session. Protocols like Shadowsocks-AEAD and XTLS track nonces and session states; they will immediately drop the replayed connection to defend against active probing. Real web servers process replayed ClientHellos normally.
+*   **SS-AEAD Length Probe:** Sends exactly 50 bytes of random data. Shadowsocks-AEAD expects specific block sizes and will wait for the block to complete, then abruptly terminate the connection, revealing its state machine behavior.
 
-#### 7. SNITCH Latency & ICMP Traceroute
-*   **SNITCH (Speed of Light):** Calculates the physical distance between the scanner and the target using GeoIP. It computes the absolute minimum time light takes to travel this distance in fiber optics. If the measured `TCP RTT` is *faster* than the speed of light, the server is using an Anycast network (Cloudflare) or a WARP proxy.
-*   **Traceroute:** Uses `scapy` to send ICMP packets with incrementing TTL. Looks for `10.X.Y.Z` subnets in the middle of the route (typical management subnets for DPI/TSPU hardware).
+#### 7. Latency Physics (SNITCH) & ICMP Traceroute
+*   **SNITCH (Speed of Light Verification):** Calculates the geographic distance between the scanning machine and the server's GeoIP location using the Haversine formula. It then computes the absolute minimum time required for light to travel that distance through fiber optic cables. If the measured TCP Round-Trip Time (RTT) is physically impossible (i.e., faster than the speed of light for that distance), the IP address is a localized Anycast edge node (like Cloudflare or WARP) masquerading as the target location.
+*   **Traceroute Injection Mapping:** Uses `scapy` to execute an ICMP traceroute. It specifically analyzes intermediate hops looking for `10.X.Y.Z` internal subnets. Russian ISPs route traffic through these specific management subnets to pass packets through TSPU DPI hardware before they exit the country.
 
 #### 8. Verdict, Reporting & Diffing
-Aggregates all Strong, Soft, and Informational signals to generate a final score (0-100) and an emulated TSPU DPI block verdict. Supports JSON/HTML exports and cross-report diffing.
+The tool processes the gathered data into a DPI Exposure Matrix. It classifies signals into Strong, Soft, and Informational categories, applies penalty weights, and calculates a final score from 0 to 100. 
+It supports exporting raw data to JSON, generating HTML visual reports, and running diff comparisons (`--compare`) against previous scans to monitor OPSEC degradation over time.
 
-### 🚀 Installation
+### Installation
 
-This tool requires **Linux** and root privileges (for Scapy raw sockets).
+This tool operates at the network interface layer and requires a Linux environment with root privileges.
 
 ```bash
-# Clone the repository
-git clone https://github.com/FlexEbat/BybyeVPNLinux.git
+git clone https://github.com/FlexEbat/ByebyeVPNLinux.git
 cd ByebyeVPNLinux
 
-# Create a virtual environment (Recommended)
 python3 -m venv env
 source env/bin/activate
 
-# Install dependencies
 pip install scapy curl_cffi
 ```
 
-### 💻 Usage
+### Usage
 
-Run the script with `sudo` (required for ICMP Traceroute, PMTUD, and Scapy SYN scanning).
+Root privileges (`sudo`) are strictly required for ICMP Traceroute, PMTUD, and Scapy SYN scanning.
 
 ```bash
-# Full scan (all 65535 ports)
+# Full exhaustive scan across all 65535 TCP ports
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN>
 
-# Fast scan (only common VPN/Web ports)
+# Fast scan limited to common Web and VPN ports
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --fast
 
-# Export results to JSON and HTML
+# Execute scan and export raw JSON and an HTML report
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --json --html
 
-# Compare current scan against a previous JSON report (Continuous Monitoring)
+# Compare current network state against a historical JSON report
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --compare <IP_OR_DOMAIN>_report.json
 ```
 
 ---
 
 <a id="русский"></a>
-## 🇷🇺 Русский
+## Русский
 
-> **Примечание:** Этот проект является Linux-форком оригинальной утилиты [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN). Он был глубоко переработан и расширен для работы в Linux с использованием сырых сокетов, библиотеки `scapy` для скрытного сканирования и точной трассировки сети, а также `curl_cffi` для продвинутого фингерпринтинга TLS.
+**Примечание:** Данный проект представляет собой Linux-форк оригинального инструмента [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN). Исходный код был фундаментально переписан для работы в среде Linux с использованием сырых сокетов (raw sockets), библиотеки `scapy` для низкоуровневых манипуляций с сетевыми пакетами и `curl_cffi` для точной подделки TLS-фингерпринтов.
 
-### 📌 Обзор
-**ByebyeVPNLinux** — это инструмент корпоративного уровня (Enterprise-grade) для сетевого анализа и пентеста. Он создан для оценки «заметности» VPN-туннелей, прокси и средств обхода блокировок (Xray, Trojan, Shadowsocks, WireGuard, Amnezia и др.) для систем глубокого анализа пакетов (DPI). Скрипт детально эмулирует логику работы российских комплексов ТСПУ и Великого Китайского Файрвола (GFW).
+### Обзор
 
-Он сканирует целевой IP/домен, выполняет массивную серию активных и пассивных сетевых проверок на уровнях L3-L7 и рассчитывает "DPI Exposure Score" (уровень заметности), чтобы понять, насколько очевиден ваш туннель для цензора.
+ByebyeVPNLinux — это низкоуровневый набор инструментов для сетевой диагностики и тестирования на проникновение. Его главная задача — оценка операционной безопасности (OPSEC) и степени обнаруживаемости протоколов обхода блокировок, прокси и VPN (Xray, Trojan, Shadowsocks, WireGuard, AmneziaWG и др.) системами глубокого анализа пакетов (DPI).
 
-### ⚙️ Стратегии проверок и как они работают
+Инструмент детально эмулирует эвристические алгоритмы и механизмы активного зондирования, применяемые государственными системами фильтрации, в частности российскими ТСПУ (Технические средства противодействия угрозам) и Великим Китайским Файрволом (GFW). Итоговый рейтинг уязвимости для DPI рассчитывается на основе нарушений стандартов RFC, криптографических аномалий, тайминг-атак и физических несоответствий маршрутизации.
 
-Сканер выполняет 8 различных фаз глубокого анализа:
+### Стратегии проверок и техническая реализация
 
-#### 1. DNS Разрешение (DNS Resolution)
-Определяет IPv4-адрес целевого домена для базовой маршрутизации.
+Сканер выполняет восемь фаз глубокого анализа, двигаясь от сетевого уровня (Layer 3) к прикладному (Layer 7).
 
-#### 2. GeoIP, BGP и OSINT (Параллельный опрос)
-*   **GeoIP и ASN:** Опрашивает 7 провайдеров. Если ASN принадлежит дата-центру (Hetzner, AWS и т.д.), IP получает флаг `HOSTING`. Системы DPI используют это как первичный фильтр доверия.
-*   **BGP Prefix:** Извлекает маршрутные префиксы для проверки легитимности ASN.
-*   **Reverse DNS (PTR):** Проверяет наличие обратной DNS-записи. Отсутствие PTR или несоответствие домену TLS — классический признак "серой" прокси-инфраструктуры.
+#### 1. Разрешение DNS
+Перед инициализацией любых TCP/UDP соединений инструмент преобразует целевой домен в IPv4-адрес. Это устанавливает базовый IP для всех последующих тестов прямой маршрутизации, исключая влияние локального кэширования DNS или настроек DNS-over-HTTPS.
+
+#### 2. GeoIP, BGP-маршрутизация и OSINT
+Системы DPI используют базы данных автономных систем (ASN) как первый слой классификации трафика.
+*   **Профилирование ASN:** Инструмент параллельно опрашивает несколько баз GeoIP. Если IP-адрес принадлежит коммерческому дата-центру или облачному провайдеру (Hetzner, DigitalOcean, AWS), он помечается. Государственные цензоры изначально применяют более строгие правила к трафику, идущему в коммерческие ASN, по сравнению с домашними провайдерами.
+*   **Анализ BGP-маршрутизации:** Извлекает BGP-префиксы для проверки соответствия маршрутного анонса заявленной ASN, что позволяет выявлять перехваты BGP или аномалии "абузоустойчивых" хостингов.
+*   **Reverse DNS (PTR):** Легитимный веб-сервер, как правило, имеет PTR-запись, совпадающую с его доменом TLS. У прокси-серверов PTR-записи часто отсутствуют или разрешаются в стандартные имена хостеров (например, `vps-12345.hoster.com`). Несоответствие здесь — сильный индикатор "серой" инфраструктуры.
 
 #### 3. TCP Stealth SYN-сканирование и профилирование L3
-*   **Stealth SYN Scan (Scapy):** "Тихое" полуоткрытое сканирование портов, оставляющее минимум следов в логах целевого сервера.
-*   **Path MTU Discovery (PMTUD):** Отправляет ICMP-пакеты с флагом `DF` (Don't Fragment) разного размера (от 1500 до 1380). Если MTU соединения `< 1500` (например, 1420), скрипт математически доказывает наличие издержек туннельной инкапсуляции (VPN).
-*   **TTL Tracking (Поиск инъекций):** Сравнивает TTL пакетов от открытых и закрытых портов. Разница `> 2` является 100% доказательством того, что DPI (ТСПУ/GFW) стоит на маршруте и активно подделывает пакеты.
-*   **OS Fingerprinting:** Угадывает ОС сервера по размеру окна TCP Receive Window (аналог утилиты p0f).
+Вместо стандартных системных вызовов `connect()`, которые оставляют следы в логах приложений на стороне сервера, эта фаза конструирует пакеты вручную.
+*   **Stealth SYN Scan:** Использует `scapy` для отправки SYN-пакетов. При получении SYN-ACK инструмент немедленно отправляет пакет RST для разрыва полуоткрытого соединения, чтобы операционная система сервера не передала данные на уровень приложения.
+*   **Path MTU Discovery (PMTUD):** Стандартный размер Maximum Transmission Unit для Ethernet составляет 1500 байт. Туннельные протоколы (WireGuard, IPsec) добавляют собственные заголовки, снижая доступный MTU. Инструмент отправляет ICMP Echo запросы с флагом `DF` (Don't Fragment), постепенно уменьшая размер полезной нагрузки. Если максимально возможный размер пакета составляет ровно 1420 или 1380 байт, это математически доказывает наличие инкапсуляции VPN на маршруте.
+*   **Отслеживание TTL и обнаружение Middlebox:** Анализирует поле Time-To-Live (TTL) в возвращающихся IP-пакетах. Если открытый порт отвечает с TTL 54, а закрытый — с TTL 114, это доказывает, что оборудование промежуточной фильтрации (например, узел ТСПУ) перехватывает соединение и инжектит собственные пакеты до того, как они достигнут реального сервера.
+*   **Фингерпринтинг TCP Window:** Считывает сырые значения TCP Window и MSS из пакета SYN-ACK для определения ядра операционной системы сервера независимо от прикладного ПО.
 
-#### 4. Пробы UDP и обнаружение FakeDNS
-*   **Real Handshakes:** Вместо обычного сканирования отправляет **реальные пакеты инициализации протоколов** (WireGuard, AmneziaWG (Sx=8), OpenVPN, QUIC, TUIC v5, Hysteria2, L2TP, IKEv2).
-*   **WG Malformed Profiling:** Отправка "битых" пакетов WireGuard для определения того, работает ли протокол в ядре (Kernel) или в Userspace (`wireguard-go`).
-*   **FakeDNS Leak:** Отправляет DNS-запрос заблокированного домена. Если сервер возвращает локальный IP (например, `198.18.x.x` или `10.x.x.x`), скрипт выявляет включенный модуль FakeDNS (часто используется в Xray/V2Ray).
+#### 4. UDP зондирование и обнаружение FakeDNS
+Стандартное сканирование UDP портов полагается на ненадежные ответы ICMP Destination Unreachable. Этот инструмент использует специфичные для протоколов полезные нагрузки инициализации.
+*   **Детерминированные рукопожатия:** Отправляет точные байтовые последовательности инициализации для WireGuard, AmneziaWG (со специфичными магическими заголовками Sx=8), OpenVPN (HARD_RESET), QUIC, TUIC v5, Hysteria2, L2TP и IKEv2. Валидный ответ абсолютно подтверждает наличие протокола.
+*   **Профилирование искаженного WireGuard:** Отправляет намеренно поврежденные последовательности MAC-адресов WireGuard. Реализация протокола в пространстве ядра (Kernel) игнорирует их молча; реализации в пространстве пользователя (например, `wireguard-go`) часто генерируют отличимые паттерны ошибок или специфические ICMP-ответы.
+*   **Утечка FakeDNS:** Прокси-клиенты вроде V2Ray часто перехватывают DNS-запросы, возвращая фиктивные локальные IP-адреса (например, 198.18.0.1) внутренним клиентам для отслеживания соединений. Инструмент отправляет сырой DNS-запрос для заведомо заблокированного домена. Если сервер отвечает диапазоном частных IP, это раскрывает наличие модуля маршрутизации FakeDNS.
 
-#### 5. Фингерпринтинг сервисов, Web и Криптографии (L7)
-*   **uTLS Dual-Probe (Детектор Reality):** Выполняет два TLS-рукопожатия: одно стандартное через `OpenSSL`, второе с маскировкой под `Chrome 131`. Если сервер сбрасывает одно соединение, но принимает второе, это доказывает анализ `ClientHello` (JA3/JA4) — маркер XTLS-Reality.
-*   **Certificate Transparency (CT Logs):** Проверяет серверный сертификат по базе `crt.sh`. Отсутствие сертификата в публичных логах (или выдача 5 минут назад) выдает динамически сгенерированные сертификаты ShadowTLS/Reality.
-*   **ALPN и Валидность:** Проверяет согласованные протоколы (h2, http/1.1) и выявляет самоподписанные сертификаты на 10 лет (классика OpenVPN/Shadowsocks).
-*   **WebSocket Upgrade Anomaly:** Отправка фальшивого запроса на WS-соединение. Странные ответы (400 Bad Request вместо 404) выдают маскировку V2Ray WS.
-*   **Тайминг-атаки (Slowloris):** Отправка неполных HTTP-заголовков. Прокси агрессивно рвут такие соединения (< 3 сек), тогда как настоящие веб-серверы ждут тайм-аута.
-*   **Domain Fronting:** Отправка SNI одного домена, а HTTP-заголовка `Host` — другого. Настоящие CDN заблокируют это (`421 Misdirected Request`), а глупые прокси пропустят.
+#### 5. Фингерпринтинг сервисов, Web и криптографии (L7)
+*   **uTLS Dual-Probe (Дискриминатор Reality):** XTLS-Reality обходит DPI, сбрасывая соединения, которые не соответствуют определенным отпечаткам TLS ClientHello (например, отпечаткам современных браузеров). Инструмент инициирует два TLS-соединения: одно со стандартным отпечатком OpenSSL и второе, имитирующее Chrome 131 с помощью `curl_cffi`. Если сервер сбрасывает OpenSSL, но принимает Chrome, это доказывает активную работу дискриминатора Reality.
+*   **Валидация Certificate Transparency (CT):** Выполняет запрос к `crt.sh`. Легитимные сертификаты Let's Encrypt или ZeroSSL фиксируются в публичных базах CT. Если сервер предъявляет валидный сертификат, отсутствующий в логах CT, это указывает на то, что сертификат динамически генерируется в оперативной памяти (сигнатура ShadowTLS или XTLS-Reality).
+*   **ALPN и долгосрочные сертификаты:** Проверяет согласование протоколов прикладного уровня (ALPN). Дополнительно анализируется срок действия сертификата. Самоподписанные сертификаты со сроком действия 10 лет — классическая сигнатура устаревших конфигураций Shadowsocks или OpenVPN.
+*   **Тайминг-атаки (Вариация Slowloris):** Отправляет частичный HTTP GET запрос без завершающей последовательности `\r\n\r\n`. Стандартные веб-серверы (Nginx/Apache) ожидают завершения запроса до 60 секунд. Прокси-серверы настроены на агрессивное прерывание зависших соединений (часто менее чем за 3 секунды) для предотвращения атак на исчерпание ресурсов.
+*   **Проверка Domain Fronting:** Отправляет TLS ClientHello с нейтральным SNI, но устанавливает HTTP-заголовок `Host` на реальный целевой домен. Строгие CDN отклоняют такие запросы ошибкой 421 Misdirected Request. Неправильно настроенные прокси обрабатывают их вслепую.
 
 #### 6. J3 / Активное зондирование ТСПУ и Replay-атаки
-*   **Canned Fallback Detect:** Отправка разного TCP-мусора, SSH-баннеров и байтов `0xFF`. Если сервер отвечает **абсолютно одинаковой HTTP-ошибкой** (например, идентичный `400 Bad Request`) на разный мусор — это гарантированная сигнатура fallback-заглушки Xray/Trojan.
-*   **Анализ Энтропии:** Вычисляет энтропию по Шеннону ответа сервера. Энтропия `> 7.5` указывает на сильно обфусцированные/зашифрованные данные (сигнатура VMess/Shadowsocks).
-*   **Replay-атаки (Воспроизведение):** Скрипт записывает успешный `TLS ClientHello` и отправляет его заново в новом соединении. Если сервер мгновенно рвет второе соединение, это доказывает наличие Anti-Replay защиты (Shadowsocks-AEAD / XTLS).
-*   **SS-AEAD Length Probe:** Отправка ровно 50 байт мусора. Серверы Shadowsocks-AEAD ждут завершения блока и сразу рвут соединение, раскрывая себя.
-*   **HTTP/2 Profiling:** Отправка сырых H2 префиксов для обнаружения нестандартных HTTP/2 реализаций внутри прокси.
+Системы DPI активно проверяют подозрительные прокси-порты, отправляя мусорные данные, чтобы проанализировать реакцию сервера.
+*   **Обнаружение Canned Fallback:** Инструмент отправляет сырой TCP-мусор, баннеры протокола SSH и байты `0xFF` на целевой порт. Стандартные веб-серверы вернут различные HTTP-ошибки (или просто закроют сокет) в зависимости от ввода. Прокси (Xray/Trojan) маршрутизируют весь нераспознанный трафик на статический обработчик fallback. Если инструмент получает абсолютно одинаковый HTTP-ответ (например, математически идентичную ошибку 400 Bad Request размером ровно 360 байт) на совершенно разные искаженные нагрузки — это неоспоримая сигнатура работы прокси.
+*   **Анализ энтропии:** Рассчитывает энтропию по Шеннону для ответа сервера на случайные байты. Если энтропия превышает 7.5 бит на байт, ответ сильно обфусцирован или зашифрован без стандартных заголовков протокола, что является базовой сигнатурой VMess или Shadowsocks.
+*   **Replay-атаки:** Записывает валидный пакет TLS ClientHello и передает его повторно в новой TCP-сессии. Протоколы типа Shadowsocks-AEAD и XTLS отслеживают nonce и состояния сессий; они немедленно сбрасывают повторное соединение для защиты от активного зондирования. Настоящие веб-серверы обрабатывают повторные ClientHello в штатном режиме.
+*   **Зондирование длины SS-AEAD:** Отправляет ровно 50 байт случайных данных. Shadowsocks-AEAD ожидает определенных размеров блоков и будет ждать завершения блока, после чего резко разорвет соединение, раскрывая поведение своего конечного автомата.
 
-#### 7. SNITCH-Латентность и ICMP Traceroute
-*   **SNITCH (Скорость света):** Вычисляет физическое расстояние до сервера (по GeoIP) и рассчитывает минимальное время прохождения света по оптоволокну. Если `TCP RTT` (пинг) *быстрее* скорости света, значит сервер использует Anycast-сеть (Cloudflare) или WARP-прокси.
-*   **Traceroute:** Использует `scapy` для отправки ICMP-пакетов с возрастающим TTL. Ищет подсети `10.X.Y.Z` в середине маршрута — типичные сети управления ТСПУ/DPI.
+#### 7. Латентная физика (SNITCH) и ICMP Traceroute
+*   **SNITCH (Проверка скорости света):** Вычисляет географическое расстояние между сканирующей машиной и GeoIP-локацией сервера с помощью формулы гаверсинуса. Затем рассчитывает абсолютное минимальное время, необходимое свету для преодоления этого расстояния по оптоволоконным кабелям. Если измеренное время приема-передачи TCP (RTT) физически невозможно (т.е. быстрее скорости света для данного расстояния), значит IP-адрес является локализованным пограничным узлом Anycast (например, Cloudflare или WARP), маскирующимся под целевую локацию.
+*   **Картирование инъекций Traceroute:** Использует `scapy` для выполнения ICMP-трассировки. Специфично анализирует промежуточные узлы на наличие внутренних подсетей `10.X.Y.Z`. Российские интернет-провайдеры маршрутизируют трафик через эти специфические подсети управления для пропуска пакетов через аппаратное обеспечение DPI ТСПУ перед выходом за пределы страны.
 
-#### 8. Вердикт, Отчеты и Сравнение (Diffing)
-Скрипт формирует финальный рейтинг (0-100) и эмулирует вердикт блокировки ТСПУ. Поддерживает экспорт в JSON/HTML и сравнение текущего сканирования с предыдущим.
+#### 8. Вердикт, отчетность и сравнение (Diffing)
+Инструмент обрабатывает собранные данные в Матрицу обнаружения DPI (DPI Exposure Matrix). Сигналы классифицируются на Сильные, Слабые и Информационные, к ним применяются весовые коэффициенты штрафов, после чего рассчитывается итоговый балл от 0 до 100.
+Поддерживается экспорт сырых данных в JSON, генерация визуальных HTML-отчетов и выполнение сравнений (`--compare`) с предыдущими сканированиями для мониторинга деградации OPSEC с течением времени.
 
-### 🚀 Установка
+### Установка
 
-Для работы утилиты требуется **Linux** и права root (для сырых сокетов Scapy).
+Данный инструмент работает на уровне сетевых интерфейсов и требует среды Linux с правами root.
 
 ```bash
-# Клонируем репозиторий
 git clone https://github.com/FlexEbat/ByebyeVPNLinux.git
 cd ByebyeVPNLinux
 
-# Создаем виртуальное окружение (Рекомендуется)
 python3 -m venv env
 source env/bin/activate
 
-# Устанавливаем зависимости
 pip install scapy curl_cffi
 ```
 
-### 💻 Использование
+### Использование
 
-Запускайте скрипт через `sudo` (это необходимо для работы ICMP Traceroute, PMTUD и Scapy SYN-сканирования).
+Права суперпользователя (`sudo`) строго обязательны для выполнения ICMP Traceroute, PMTUD и Stealth SYN сканирования через Scapy.
 
 ```bash
-# Полное сканирование (все 65535 портов)
+# Полное исчерпывающее сканирование всех 65535 TCP портов
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_ИЛИ_ДОМЕН>
 
-# Быстрое сканирование (только основные порты VPN/Web)
+# Быстрое сканирование, ограниченное общими портами Web и VPN
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_ИЛИ_ДОМЕН> --fast
 
-# Экспорт результатов в форматы JSON и HTML
+# Выполнение сканирования и экспорт сырого JSON и HTML-отчета
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_ИЛИ_ДОМЕН> --json --html
 
-# Сравнение текущего сканирования с предыдущим отчетом (Для мониторинга)
+# Сравнение текущего состояния сети с историческим JSON-отчетом
 sudo ./env/bin/python3 byebyevpnlinux.py <IP_ИЛИ_ДОМЕН> --compare <IP_ИЛИ_ДОМЕН>_report.json
 ```
 
 ---
-⚠️ **Disclaimer / Отказ от ответственности:**  
-*This tool is intended for educational purposes, network defense analysis, and evaluating the OPSEC of your own servers. The author is not responsible for any misuse.*
 
-*Инструмент предназначен исключительно для образовательных целей, анализа защиты сетей и проверки OPSEC собственных серверов. Автор не несет ответственности за любое неправомерное использование.*
+**Отказ от ответственности:**
+Данный инструмент предназначен исключительно для образовательных целей, анализа защиты сетей и оценки OPSEC собственных инфраструктур. Автор не несет ответственности за любое неправомерное использование инструмента.
