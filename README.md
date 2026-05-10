@@ -1,7 +1,3 @@
-
-
-
-
 # ByebyeVPNLinux
 
 **[English](#english)** | **[Русский](#русский)**
@@ -12,8 +8,6 @@
 ## English
 
 **Note:** This project is a Linux fork of the original [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN) tool. It has been fundamentally rewritten for Linux environments to utilize raw sockets, the `scapy` library for precise network-level manipulation, and `curl_cffi` for accurate TLS fingerprint spoofing.
-
-### Overview
 
 ByebyeVPNLinux is a low-level network diagnostic and penetration testing toolkit. Its primary purpose is to evaluate the operational security (OPSEC) and detectability of circumvention protocols, proxies, and VPNs (Xray, Trojan, Shadowsocks, WireGuard, AmneziaWG, etc.) against passive and active Deep Packet Inspection (DPI) systems. 
 
@@ -105,8 +99,6 @@ sudo ./env/bin/python3 byebyevpnlinux.py <IP_OR_DOMAIN> --compare <IP_OR_DOMAIN>
 ## Русский
 
 **Примечание:** Данный проект представляет собой Linux-форк оригинального инструмента [ByeByeVPN](https://github.com/pwnnex/ByeByeVPN). Исходный код был фундаментально переписан для работы в среде Linux с использованием сырых сокетов (raw sockets), библиотеки `scapy` для низкоуровневых манипуляций с сетевыми пакетами и `curl_cffi` для точной подделки TLS-фингерпринтов.
-
-### Обзор
 
 ByebyeVPNLinux — это низкоуровневый набор инструментов для сетевой диагностики и тестирования на проникновение. Его главная задача — оценка операционной безопасности (OPSEC) и степени обнаруживаемости протоколов обхода блокировок, прокси и VPN (Xray, Trojan, Shadowsocks, WireGuard, AmneziaWG и др.) системами глубокого анализа пакетов (DPI).
 
