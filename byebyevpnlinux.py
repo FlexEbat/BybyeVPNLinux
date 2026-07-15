@@ -1658,6 +1658,7 @@ async def main():
         parser.print_help(); sys.exit(1)
 
     log.p("ByeByeVPN Python Port — v1.2 spec-aligned\n", MAGENTA)
+    log.p("This project is a fork - https://github.com/pwnnex/ByeByeVPN\n", MAGENTA)
 
     if args.cmd == "scan": await cmd_scan(args.host, args)
     elif args.cmd == "dpi": await cmd_dpi(args.host)
