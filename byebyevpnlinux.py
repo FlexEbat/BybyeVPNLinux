@@ -159,6 +159,36 @@ async def https_get(host, path, port=443, timeout=3.0, extra_headers=""):
 
 
 # ===================================================================
+# COMMON: Shannon entropy helper (used by J3 / replay / fakedns / slowloris modules)
+# ===================================================================
+def shannon_entropy(data: bytes) -> float:
+    """Классическая энтропия Шеннона (бит/байт), 0..8. Высокая (~7.9-8.0) -> шифртекст/
+    случайные данные; низкая -> текстовый/структурированный протокол (HTTP, банеры и т.д.)."""
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    ent = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            ent -= p * math.log2(p)
+    return ent
+
+
+def classify_entropy(ent: float) -> str:
+    if ent >= 7.5:
+        return "очень высокая -> похоже на шифртекст/случайные данные (AEAD, padding, TLS)"
+    if ent >= 6.0:
+        return "средняя-высокая -> смешанный бинарный/сжатый контент"
+    if ent >= 4.0:
+        return "средняя -> структурированный бинарный протокол"
+    return "низкая -> текстовый протокол (HTTP/SSH-banner/plain)"
+
+
+# ===================================================================
 # MODULE 1: BYTE-ACCURATE CHROME 131 CLIENTHELLO + GENERIC TLS PARSER
 #           + JA4 / JA4S (simplified, spec-shaped)
 # ===================================================================
@@ -413,6 +443,437 @@ async def cmd_sweep(cidr):
 
 
 # ===================================================================
+# MODULE 9: PMTUD FINGERPRINT — detect VPN encapsulation overhead via
+#           ICMP Echo with DF set, binary-searching the path MTU.
+# ===================================================================
+# Typical encapsulation overheads people actually ship:
+#   1500  - no tunnel / native path
+#   1480  - PPPoE
+#   1420  - WireGuard/AmneziaWG default
+#   1400  - common OpenVPN/L2TP-over-UDP default
+#   1350  - Hysteria2/QUIC-over-UDP typical
+#   1280  - IPv6 minimum / some aggressive tunnel configs
+_PMTUD_KNOWN = [
+    (1500, "нет туннеля / нативный путь"),
+    (1480, "PPPoE overhead"),
+    (1420, "WireGuard/AmneziaWG default MTU"),
+    (1400, "типичный OpenVPN/L2TP-over-UDP default"),
+    (1350, "типично для Hysteria2/QUIC-туннелей"),
+    (1280, "IPv6-минимум / агрессивно урезанный туннель"),
+]
+
+
+def pmtud_probe(ip, hi=1500, lo=576):
+    """Двоичный поиск MTU: ICMP Echo с DF=1, размер пакета уменьшается пока
+    не перестанем получать 'Fragmentation Needed' (type 3 code 4) / таймауты."""
+    log.p("\n[PMTUD] Path MTU discovery (ICMP DF-bit binary search)", CYAN)
+
+    def probe_size(size):
+        # ICMP header is 8 bytes, IP header (no options) is 20 bytes.
+        payload_len = size - 28
+        if payload_len < 0:
+            return False
+        pkt = IP(dst=ip, flags="DF") / ICMP(id=os.getpid() & 0xFFFF) / (b"P" * payload_len)
+        reply = sr1(pkt, timeout=1.2, verbose=0)
+        if reply is None:
+            return False  # trattato как "не проходит" (осторожно, могло быть просто filtered)
+        if reply.haslayer(ICMP) and reply[ICMP].type == 3 and reply[ICMP].code == 4:
+            return False  # Fragmentation Needed
+        return reply.haslayer(ICMP) and reply[ICMP].type == 0  # Echo Reply
+
+    best = None
+    a, b = lo, hi
+    # квази-двоичный поиск с ограничением на число проб
+    for _ in range(9):
+        mid = (a + b) // 2
+        ok = probe_size(mid)
+        if ok:
+            best = mid
+            a = mid + 1
+        else:
+            b = mid - 1
+        if a > b:
+            break
+
+    if best is None:
+        log.p("  [-] PMTUD: нет ответов даже на минимальный размер — ICMP, вероятно, фильтруется.", YELLOW)
+        return None
+
+    note = "нестандартный MTU (возможна инкапсуляция)"
+    for mtu_val, desc in _PMTUD_KNOWN:
+        if abs(best - mtu_val) <= 4:
+            note = desc
+            break
+
+    flag = best < 1500 - 4
+    log.p(f"  Path MTU ~= {best}  -> {note}", RED if flag else GREEN)
+    return {"mtu": best, "note": note, "encapsulated": flag}
+
+
+# ===================================================================
+# MODULE 10: BGP prefix / routing anomaly analysis (RIPEstat, HTTPS-only)
+# ===================================================================
+async def bgp_anomaly_check(ip, geoip_country=None, geoip_asn_str=None):
+    log.p("\n[BGP] Prefix / routing anomaly check (stat.ripe.net)", CYAN)
+    result = {"origin_asn": None, "prefix": None, "holder": None, "anomalies": []}
+    try:
+        resp = await https_get("stat.ripe.net", f"/data/network-info/data.json?resource={ip}", timeout=4.0)
+        body = resp.split(b"\r\n\r\n", 1)[1]
+        data = json.loads(body.decode("utf-8", "ignore"))
+        net = data.get("data", {})
+        asns = net.get("asns", [])
+        prefix = net.get("prefix")
+        result["origin_asn"] = asns[0] if asns else None
+        result["prefix"] = prefix
+        if len(asns) > 1:
+            result["anomalies"].append(f"MOAS: префикс {prefix} анонсируется {len(asns)} разными AS ({asns}) — возможен hijack/leak.")
+    except Exception:
+        log.p("  [-] RIPEstat network-info недоступен.", YELLOW)
+        return result
+
+    try:
+        resp2 = await https_get("stat.ripe.net", f"/data/as-overview/data.json?resource=AS{result['origin_asn']}", timeout=4.0)
+        body2 = resp2.split(b"\r\n\r\n", 1)[1]
+        data2 = json.loads(body2.decode("utf-8", "ignore"))
+        holder = data2.get("data", {}).get("holder")
+        result["holder"] = holder
+        if geoip_asn_str and holder and geoip_asn_str.split()[0].lstrip("AS").isdigit() is False:
+            # мягкая эвристика: холдер BGP не встречается ни в одной строке из GeoIP AS/org
+            if holder.split(",")[0].split()[0].lower() not in geoip_asn_str.lower():
+                result["anomalies"].append(
+                    f"BGP holder AS{result['origin_asn']} '{holder}' не совпадает с ASN/org из GeoIP ('{geoip_asn_str}') — возможен reroute/hijack между слоями данных.")
+    except Exception:
+        pass
+
+    try:
+        resp3 = await https_get("stat.ripe.net", f"/data/rpki-validation/data.json?resource=AS{result['origin_asn']}&prefix={result['prefix']}", timeout=4.0)
+        body3 = resp3.split(b"\r\n\r\n", 1)[1]
+        data3 = json.loads(body3.decode("utf-8", "ignore"))
+        status = data3.get("data", {}).get("status")
+        if status and status != "valid":
+            result["anomalies"].append(f"RPKI статус префикса: {status} (не valid).")
+    except Exception:
+        pass
+
+    if result["anomalies"]:
+        for a in result["anomalies"]:
+            log.p(f"  [!] {a}", RED)
+    else:
+        log.p(f"  Origin AS{result['origin_asn']} ({result.get('holder') or '?'}), prefix {result['prefix']} — аномалий не найдено.", GREEN)
+    return result
+
+
+# ===================================================================
+# MODULE 11: reverse-DNS (PTR) vs TLS-сертификат домена
+# ===================================================================
+async def ptr_cert_check(ip, target_host, open_ports):
+    log.p("\n[PTR] Reverse-DNS vs TLS-сертификат", CYAN)
+    ptr_name = None
+    try:
+        ptr_name = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        pass
+
+    tls_names = set()
+    tls_port = 443 if 443 in open_ports else (8443 if 8443 in open_ports else None)
+    if tls_port:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+            raw_sock = socket.create_connection((ip, tls_port), timeout=3.0)
+            with ctx.wrap_socket(raw_sock, server_hostname=target_host) as ssock:
+                cert = ssock.getpeercert(binary_form=False) or {}
+                for typ, val in cert.get("subjectAltName", []):
+                    if typ == "DNS":
+                        tls_names.add(val.lower())
+                for rdn in cert.get("subject", ()):
+                    for k, v in rdn:
+                        if k == "commonName":
+                            tls_names.add(v.lower())
+        except Exception:
+            pass
+
+    if not ptr_name:
+        log.p("  [-] PTR-запись отсутствует.", YELLOW)
+    else:
+        log.p(f"  PTR: {ptr_name}")
+
+    mismatch = False
+    if ptr_name and tls_names:
+        ptr_l = ptr_name.lower().rstrip(".")
+        match = any(ptr_l == n or ptr_l.endswith("." + n) or n.endswith("." + ptr_l) for n in tls_names)
+        if not match:
+            mismatch = True
+            log.p(f"  [!] PTR ({ptr_name}) не совпадает ни с одним именем из сертификата ({', '.join(tls_names)}) "
+                  f"— типично для VPS/хостинга с generic PTR под чужой сертификат.", RED)
+        else:
+            log.p("  PTR совпадает с доменом сертификата.", GREEN)
+    elif ptr_name and not tls_names:
+        log.p("  Сертификат не получен — сверка невозможна.", YELLOW)
+
+    return {"ptr": ptr_name, "cert_names": sorted(tls_names), "mismatch": mismatch}
+
+
+# ===================================================================
+# MODULE 12: FakeDNS leak (V2Ray-style DNS hijack в приватный IP)
+# ===================================================================
+_FAKEDNS_PRIVATE_RANGES = [
+    ipaddress.ip_network("198.18.0.0/15"),   # общий диапазон V2Ray/Xray FakeDNS pool
+    ipaddress.ip_network("240.0.0.0/4"),     # Clash/some cores' fake-ip pool
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT, тоже встречается как fake-ip pool
+]
+
+
+def _dns_a_query(ip, qname, port=53, timeout=1.5):
+    txid = random.randint(0, 0xFFFF)
+    header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+    qparts = b"".join(struct.pack("B", len(p)) + p.encode() for p in qname.split("."))
+    question = qparts + b"\x00" + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+    pkt = header + question
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(pkt, (ip, port))
+        data, _ = s.recvfrom(512)
+    except Exception:
+        return []
+    finally:
+        s.close()
+    try:
+        ancount = struct.unpack(">H", data[6:8])[0]
+        pos = 12
+        # skip question section
+        while data[pos] != 0:
+            pos += data[pos] + 1
+        pos += 5  # null byte + QTYPE + QCLASS
+        ips = []
+        for _ in range(ancount):
+            # name (usually a pointer, 2 bytes)
+            if data[pos] & 0xC0 == 0xC0:
+                pos += 2
+            else:
+                while data[pos] != 0:
+                    pos += data[pos] + 1
+                pos += 1
+            rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[pos:pos + 4]))
+            pos += rdlen
+        return ips
+    except Exception:
+        return []
+
+
+def fakedns_leak_check(ip, open_ports):
+    log.p("\n[FakeDNS] Проверка утечки FakeDNS (V2Ray-style hijack)", CYAN)
+    if 53 not in open_ports:
+        log.p("  [-] Порт 53/udp не открыт (или не просканирован) — пропуск.", YELLOW)
+        return {"tested": False, "leak": False}
+
+    probe_name = f"{secrets.token_hex(6)}.bbv-probe.invalid"
+    answers = _dns_a_query(ip, probe_name)
+    leaked_ranges = []
+    for a in answers:
+        addr = ipaddress.ip_address(a)
+        for net in _FAKEDNS_PRIVATE_RANGES:
+            if addr in net:
+                leaked_ranges.append((a, str(net)))
+                break
+
+    if leaked_ranges:
+        log.p(f"  [!] DNS-резолвер отвечает на несуществующее .invalid-имя приватным/fake-ip адресом: "
+              f"{', '.join(f'{a} (∈{n})' for a, n in leaked_ranges)} — похоже на FakeDNS/DNS-хайджек.", RED)
+        return {"tested": True, "leak": True, "answers": answers}
+    if answers:
+        log.p(f"  Ответ получен, но не в приватных/fake-ip диапазонах: {answers}", GREEN)
+    else:
+        log.p("  Нет ответа на заведомо несуществующее имя — DNS-хайджека не выявлено.", GREEN)
+    return {"tested": True, "leak": False, "answers": answers}
+
+
+# ===================================================================
+# MODULE 13: domain fronting check (нейтральный SNI + чужой Host)
+# ===================================================================
+_FRONTING_NEUTRAL_SNI = ["www.cloudflare.com", "d1.awsstatic.com", "www.bing.com"]
+
+
+async def domain_fronting_check(ip, port, target_host):
+    log.p("\n[Fronting] Domain fronting (нейтральный SNI + Host != SNI)", CYAN)
+    neutral_sni = random.choice(_FRONTING_NEUTRAL_SNI)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        raw = socket.create_connection((ip, port), timeout=3.0)
+        with ctx.wrap_socket(raw, server_hostname=neutral_sni) as ssock:
+            req = f"GET / HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n".encode()
+            ssock.sendall(req)
+            ssock.settimeout(3.0)
+            chunks = []
+            try:
+                while True:
+                    c = ssock.recv(4096)
+                    if not c:
+                        break
+                    chunks.append(c)
+            except Exception:
+                pass
+            resp = b"".join(chunks)
+    except Exception:
+        log.p(f"  [-] TLS-сессия с SNI={neutral_sni} не установилась — фронтинг через этот узел не проходит.", GREEN)
+        return {"fronting_possible": False}
+
+    status_line = resp.split(b"\r\n", 1)[0] if resp else b""
+    accepted = resp and (b" 200 " in status_line or b" 30" in status_line)
+    if accepted:
+        log.p(f"  [!] SNI={neutral_sni}, Host={target_host}: сервер ответил {status_line.decode('utf-8','ignore')} "
+              f"— запрос был обработан несмотря на несовпадение SNI/Host. Domain fronting через этот узел возможен.", RED)
+    else:
+        log.p(f"  SNI={neutral_sni} != Host={target_host} -> {status_line.decode('utf-8','ignore') or 'нет ответа'} "
+              f"(фронтинг не подтверждён).", GREEN)
+    return {"fronting_possible": bool(accepted), "sni": neutral_sni, "status": status_line.decode("utf-8", "ignore")}
+
+
+# ===================================================================
+# MODULE 14: Slowloris-style timing-проба (ОДНО соединение, не DoS!)
+#            Шлём заголовки HTTP по одному с задержкой, смотрим когда
+#            сервер потеряет терпение — сигнал агрессивности таймаута/WAF.
+# ===================================================================
+async def slowloris_timing_probe(ip, port, target_host, drip_delay=2.0, max_headers=6):
+    log.p("\n[Slowloris] Timing-проба таймаута сервера (одно соединение, без флуда)", CYAN)
+    t0 = time.time()
+    sent_headers = 0
+    closed_at = None
+    try:
+        r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3.0)
+        w.write(f"GET /?probe={secrets.token_hex(4)} HTTP/1.1\r\n".encode())
+        w.write(f"Host: {target_host}\r\n".encode())
+        await w.drain()
+        for i in range(max_headers):
+            await asyncio.sleep(drip_delay)
+            try:
+                w.write(f"X-Bbv-Drip-{i}: {secrets.token_hex(2)}\r\n".encode())
+                await w.drain()
+                sent_headers += 1
+            except Exception:
+                closed_at = time.time() - t0
+                break
+            # неблокирующая проверка, не закрыл ли сервер сокет уже
+            try:
+                data = await asyncio.wait_for(r.read(1), timeout=0.05)
+                if data == b"":
+                    closed_at = time.time() - t0
+                    break
+            except asyncio.TimeoutError:
+                pass
+        try:
+            w.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    if closed_at is not None:
+        aggressiveness = "агрессивный" if closed_at < 5 else ("умеренный" if closed_at < 15 else "мягкий/отсутствует")
+        log.p(f"  Сервер оборвал недозаполненный запрос через {closed_at:.1f}s "
+              f"после {sent_headers} drip-заголовков -> таймаут {aggressiveness} (возможен anti-slowloris/WAF).",
+              GREEN if closed_at < 10 else YELLOW)
+        return {"tested": True, "closed_after_s": round(closed_at, 1), "headers_sent": sent_headers}
+    else:
+        log.p(f"  Сервер держал соединение открытым весь тест ({sent_headers} drip-заголовков, "
+              f"{drip_delay * max_headers:.0f}s) -> таймаут не агрессивный / anti-slowloris не заметен.", YELLOW)
+        return {"tested": True, "closed_after_s": None, "headers_sent": sent_headers}
+
+
+# ===================================================================
+# MODULE 15: TLS ClientHello replay simulation (nonce-tracking для
+#            Shadowsocks-AEAD / XTLS) — ОДИН повтор идентичных байт,
+#            не флуд. Цель: есть ли anti-replay на уровне сервера.
+# ===================================================================
+async def replay_probe(ip, port, target_host):
+    log.p("\n[Replay] TLS ClientHello replay-симуляция (anti-replay check)", CYAN)
+    ch = build_chrome_131_clienthello(target_host)
+
+    async def one_shot(payload):
+        return await raw_tcp_exchange(ip, port, payload, timeout=2.5)
+
+    first = await one_shot(ch)
+    await asyncio.sleep(0.3)
+    second = await one_shot(ch)  # тот же самый ClientHello целиком (та же nonce/random)
+
+    sh1 = parse_server_hello_detailed(first)
+    sh2 = parse_server_hello_detailed(second)
+
+    both_accepted = bool(sh1) and bool(sh2)
+    identical_cipher = bool(sh1) and bool(sh2) and sh1["cipher"] == sh2["cipher"]
+
+    if both_accepted and identical_cipher:
+        log.p("  [!] Идентичный ClientHello (тот же ClientRandom) принят дважды подряд с валидным ServerHello "
+              "-> анти-replay защита на TLS-уровне не наблюдается (актуально для AEAD/XTLS nonce-reuse рисков).", RED)
+        verdict = "no_replay_protection_observed"
+    elif bool(sh1) and not bool(sh2):
+        log.p("  Первый ClientHello принят, повтор — отклонён/дропнут -> anti-replay похоже присутствует.", GREEN)
+        verdict = "replay_rejected"
+    elif not sh1:
+        log.p("  Порт не отвечает валидным ServerHello на первый ClientHello — проверка неприменима.", YELLOW)
+        verdict = "n/a"
+    else:
+        verdict = "inconclusive"
+        log.p("  Результат неоднозначен (частичные ответы) — нужно ручное подтверждение.", YELLOW)
+
+    return {"first_accepted": bool(sh1), "second_accepted": bool(sh2), "verdict": verdict}
+
+
+# ===================================================================
+# MODULE 16: TTL middlebox detection — сравнение TTL ответа с открытого
+#            и с заведомо закрытого порта. Разница = что-то на пути
+#            подменяет/проксирует один из путей (типичный признак ТСПУ/MITM).
+# ===================================================================
+def ttl_middlebox_check(ip, open_ports):
+    log.p("\n[TTL] Сравнение TTL: открытый порт vs закрытый порт", CYAN)
+    if not open_ports:
+        log.p("  [-] Нет открытых портов для сравнения.", YELLOW)
+        return {"tested": False}
+
+    open_port = open_ports[0]
+    closed_port = None
+    open_set = set(open_ports)
+    for p in range(1, 65535):
+        if p not in open_set:
+            closed_port = p
+            break
+
+    def get_ttl(port):
+        pkt = IP(dst=ip) / TCP(dport=port, flags="S")
+        reply = sr1(pkt, timeout=1.2, verbose=0)
+        if reply is None or not reply.haslayer(IP):
+            return None
+        ttl = reply[IP].ttl
+        if reply.haslayer(TCP) and reply[TCP].flags == 0x12:  # SYN-ACK
+            sr1(IP(dst=ip) / TCP(dport=port, flags="R"), timeout=0.3, verbose=0)
+        return ttl
+
+    ttl_open = get_ttl(open_port)
+    ttl_closed = get_ttl(closed_port) if closed_port else None
+
+    if ttl_open is None or ttl_closed is None:
+        log.p(f"  [-] Не удалось получить TTL для сравнения (open={ttl_open}, closed={ttl_closed}).", YELLOW)
+        return {"tested": False, "ttl_open": ttl_open, "ttl_closed": ttl_closed}
+
+    diff = abs(ttl_open - ttl_closed)
+    flagged = diff >= 2  # 1 хоп разницы — шум; 2+ обычно значимо
+    log.p(f"  TTL открытого порта {open_port}: {ttl_open}   TTL закрытого порта {closed_port}: {ttl_closed}"
+          f"   diff={diff}", RED if flagged else GREEN)
+    if flagged:
+        log.p("  [!] Разные TTL для открытого/закрытого пути -> подозрение на middlebox "
+              "(инжектится RST/ответ с другого хопа, а не с самого хоста).", RED)
+    return {"tested": True, "ttl_open": ttl_open, "ttl_closed": ttl_closed, "diff": diff, "flagged": flagged}
+
+
+# ===================================================================
 # CORE PIPELINE
 # ===================================================================
 
@@ -480,15 +941,18 @@ async def geoip_aggregation(ip):
     results = [r for r in results if r]
     is_hosting = False
     country = "?"
+    asn_str = ""
     for r in results:
         is_hosting = is_hosting or r["hosting"]
         if r["country"] != "?":
             country = r["country"]
+        if r["asn"] and r["asn"] != "Unknown":
+            asn_str = r["asn"]
         log.p(f"  {r['provider']:<14} {ip}  {r['country']}  AS {r['asn']} {'(HOSTING)' if r['hosting'] else ''}",
               YELLOW if r["hosting"] else GREEN)
     if not results:
         log.p("  [-] All GeoIP providers unreachable/blocked.", YELLOW)
-    return is_hosting, country
+    return is_hosting, country, asn_str
 
 
 # ---------- Phase 3a/3b: TCP port scan + stack fingerprint ----------
@@ -626,6 +1090,40 @@ def run_udp_probes(ip):
     if try_send(sock, quic_payload, 443, "Hysteria2 :443"):
         detected.append("Hysteria2 QUIC (:443)")
         log.p(f"  UDP:443   Hysteria2 {RED}HANDSHAKE ACCEPTED{RESET}")
+
+    # 6. OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2 (opcode 0x38, key-id 0) on 1194
+    #    layout: [opcode<<3|key_id](1) + session_id(8) + hmac/packet-id(0 for reset) + ...
+    ovpn_reset = bytes([0x38]) + secrets.token_bytes(8) + b"\x00" + secrets.token_bytes(4)
+    if try_send(sock, ovpn_reset, 1194, "OpenVPN HARD_RESET"):
+        detected.append("OpenVPN (HARD_RESET_CLIENT_V2 @1194)")
+        log.p(f"  UDP:1194  OpenVPN HARD_RESET_CLIENT_V2 {RED}ACK/HANDSHAKE ACCEPTED{RESET}")
+
+    # 7. TUIC v5 — QUIC v1 Initial with ALPN "tuic" is what actually distinguishes it;
+    #    at raw-UDP level we send a QUICv1-shaped long-header Initial on TUIC's default port.
+    tuic_quic = b'\xc3\x00\x00\x00\x01\x08' + secrets.token_bytes(16) + secrets.token_bytes(1182)
+    if try_send(sock, tuic_quic, 443, "TUIC v5 :443"):
+        detected.append("TUIC v5 (QUIC Initial @443)")
+        log.p(f"  UDP:443   TUIC v5-shaped QUIC Initial {RED}ACCEPTED{RESET}")
+    if try_send(sock, tuic_quic, 8443, "TUIC v5 :8443"):
+        detected.append("TUIC v5 (QUIC Initial @8443)")
+        log.p(f"  UDP:8443  TUIC v5-shaped QUIC Initial {RED}ACCEPTED{RESET}")
+
+    # 8. L2TP SCCRQ (Start-Control-Connection-Request) control message on 1701
+    #    layout: flags/ver(2) + length(2) + tunnel_id(2) + session_id(2) + Ns(2) + Nr(2) + AVPs...
+    l2tp_sccrq = b"\xc8\x02" + struct.pack(">H", 20) + b"\x00\x00\x00\x00\x00\x00\x00\x00" + \
+                 b"\x80\x08\x00\x00\x00\x00\x00\x01" + b"\x00\x01"
+    if try_send(sock, l2tp_sccrq, 1701, "L2TP SCCRQ"):
+        detected.append("L2TP (SCCRQ @1701)")
+        log.p(f"  UDP:1701  L2TP SCCRQ {RED}RESPONSE RECEIVED{RESET}")
+
+    # 9. IKEv2 SA_INIT (IKE_SA_INIT, exchange type 34) on 500/4500
+    ike_hdr = secrets.token_bytes(8) + b"\x00" * 8 + b"\x21\x20\x22\x08" + b"\x00" * 4 + struct.pack(">I", 28)
+    if try_send(sock, ike_hdr, 500, "IKEv2 SA_INIT :500"):
+        detected.append("IKEv2 (SA_INIT @500)")
+        log.p(f"  UDP:500   IKEv2 SA_INIT {RED}RESPONSE RECEIVED{RESET}")
+    if try_send(sock, b"\x00" * 4 + ike_hdr, 4500, "IKEv2 SA_INIT :4500 (NAT-T)"):
+        detected.append("IKEv2 (SA_INIT @4500 NAT-T)")
+        log.p(f"  UDP:4500  IKEv2 SA_INIT (NAT-T) {RED}RESPONSE RECEIVED{RESET}")
 
     sock.close()
     if not detected:
@@ -797,7 +1295,8 @@ async def j3_probes(ip, open_ports, target_host, args):
             if ans:
                 responses.append(ans)
                 clean_str = ans[:20].decode('utf-8', 'ignore').replace('\r', '').replace('\n', ' ')
-                log.p(f"    RESP {name:<20} {len(ans)}B {clean_str}", GREEN)
+                ent = shannon_entropy(ans)
+                log.p(f"    RESP {name:<20} {len(ans)}B H={ent:.2f} ({classify_entropy(ent)}) {clean_str}", GREEN)
             else:
                 if "Random" in name and (time.time() - t0) < 0.2:
                     ss_drop = True
@@ -878,6 +1377,104 @@ async def sstp_probe(host, ip, port=443):
     return detected
 
 
+# ===================================================================
+# MODULE 17: --html report generation
+# ===================================================================
+_HTML_TEMPLATE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>ByeByeVPN report — {target}</title>
+<style>
+body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:2rem;max-width:900px;margin:auto}}
+h1{{color:#58a6ff}} h2{{color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:.3rem;margin-top:2rem}}
+.score{{font-size:2.5rem;font-weight:bold}}
+.clean{{color:#3fb950}} .noisy{{color:#d29922}} .susp{{color:#db6d28}} .bad{{color:#f85149}}
+table{{border-collapse:collapse;width:100%;margin-top:.5rem}}
+td,th{{border:1px solid #30363d;padding:.4rem .6rem;text-align:left;font-size:.9rem}}
+.tag-strong{{color:#f85149}} .tag-soft{{color:#d29922}} .tag-info{{color:#79c0ff}}
+</style></head><body>
+<h1>ByeByeVPN — {target} ({ip})</h1>
+<div class="score {score_class}">{score}/100 — {label}</div>
+<p>TSPU verdict: <b>{tspu_tier}</b> — {tspu_reason}</p>
+<h2>Сигналы</h2>
+<table><tr><th>Тип</th><th>Описание</th></tr>{signal_rows}</table>
+<h2>Новые модули</h2>
+<table><tr><th>Модуль</th><th>Результат</th></tr>{extra_rows}</table>
+<h2>Raw JSON</h2><pre>{raw_json}</pre>
+</body></html>"""
+
+
+def generate_html_report(data, out_path):
+    label = data.get("verdict", {}).get("label", "?")
+    score = data.get("verdict", {}).get("score", 0)
+    score_class = {"CLEAN": "clean", "NOISY": "noisy", "SUSPICIOUS": "susp", "OBVIOUSLY VPN": "bad"}.get(label, "")
+
+    rows = []
+    for s in data.get("verdict", {}).get("strong", []):
+        rows.append(f'<tr><td class="tag-strong">STRONG</td><td>{s}</td></tr>')
+    for s in data.get("verdict", {}).get("soft", []):
+        rows.append(f'<tr><td class="tag-soft">SOFT</td><td>{s}</td></tr>')
+    for s in data.get("verdict", {}).get("info", []):
+        rows.append(f'<tr><td class="tag-info">INFO</td><td>{s}</td></tr>')
+
+    extra_rows = []
+    for key in ("pmtud", "bgp", "ptr", "fakedns", "fronting", "slowloris", "replay", "ttl_middlebox"):
+        if key in data:
+            extra_rows.append(f"<tr><td>{key}</td><td><pre>{json.dumps(data[key], ensure_ascii=False, indent=2)}</pre></td></tr>")
+
+    html = _HTML_TEMPLATE.format(
+        target=data.get("target", "?"), ip=data.get("ip", "?"),
+        score=score, label=label, score_class=score_class,
+        tspu_tier=data.get("tspu_verdict", {}).get("tier", "?"),
+        tspu_reason=data.get("tspu_verdict", {}).get("reason", "?"),
+        signal_rows="".join(rows) or "<tr><td colspan=2>—</td></tr>",
+        extra_rows="".join(extra_rows) or "<tr><td colspan=2>—</td></tr>",
+        raw_json=json.dumps(data, ensure_ascii=False, indent=2),
+    )
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        log.p(f"[+] HTML-отчёт сохранён: {out_path}", GREEN)
+    except Exception as e:
+        log.p(f"[-] Не удалось сохранить HTML-отчёт: {e}", RED)
+
+
+# ===================================================================
+# MODULE 18: --compare — diff текущего скана с прошлым JSON-отчётом
+# ===================================================================
+def compare_reports(old_path, new_data):
+    log.p(f"\n[Compare] Diff с прошлым отчётом: {old_path}", CYAN)
+    try:
+        with open(old_path, "r", encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception as e:
+        log.p(f"  [-] Не удалось прочитать {old_path}: {e}", RED)
+        return None
+
+    old_v, new_v = old.get("verdict", {}), new_data.get("verdict", {})
+    diff = {
+        "score_old": old_v.get("score"), "score_new": new_v.get("score"),
+        "label_old": old_v.get("label"), "label_new": new_v.get("label"),
+        "signals_added": sorted(set(new_data.get("signals", [])) - set(old.get("signals", []))),
+        "signals_removed": sorted(set(old.get("signals", [])) - set(new_data.get("signals", []))),
+    }
+
+    delta = (diff["score_new"] or 0) - (diff["score_old"] or 0)
+    trend = GREEN if delta > 0 else (RED if delta < 0 else CYAN)
+    log.p(f"  Score: {diff['score_old']} -> {diff['score_new']} ({'+' if delta >= 0 else ''}{delta})", trend)
+    log.p(f"  Label: {diff['label_old']} -> {diff['label_new']}", trend)
+    if diff["signals_added"]:
+        log.p("  Новые сигналы:", RED)
+        for s in diff["signals_added"]:
+            log.p(f"    + {s}", RED)
+    if diff["signals_removed"]:
+        log.p("  Пропавшие сигналы (стало лучше):", GREEN)
+        for s in diff["signals_removed"]:
+            log.p(f"    - {s}", GREEN)
+    if not diff["signals_added"] and not diff["signals_removed"]:
+        log.p("  Набор сигналов не изменился.", CYAN)
+    return diff
+
+
 # ---------- Phase 8: verdict + separate TSPU 3-tier verdict ----------
 async def cmd_scan(host, args):
     ipv4, ipv6 = await resolve_dns(host)
@@ -887,8 +1484,10 @@ async def cmd_scan(host, args):
     report_data["target"] = host
     report_data["ip"] = ip
 
-    is_hosting, country = await geoip_aggregation(ip)
+    is_hosting, country, asn_str = await geoip_aggregation(ip)
     ports_to_scan = CURATED_PORTS if args.fast else list(range(1, 65536))
+
+    bgp_result = await bgp_anomaly_check(ip, country, asn_str) if not args.no_bgp else {"anomalies": []}
 
     open_ports, med, std, closed_beh, bgp_drop, mss_info, closed_beh2 = await tcp_scan(ip, ports_to_scan, args)
 
@@ -896,11 +1495,33 @@ async def cmd_scan(host, args):
         log.p("\n[!] PASSIVE MODE ON: Skipping UDP, J3 and Fuzzer.", MAGENTA)
         udp_det, has_proxy, utls, rkn, canned, rep, ss_drop, ja4s_notes = [], False, False, False, False, False, False, []
         sstp_hit = False
+        fakedns_result = {"tested": False, "leak": False}
+        fronting_result, slowloris_result, replay_result = {"fronting_possible": False}, {"tested": False}, {"verdict": "n/a"}
     else:
         udp_det = run_udp_probes(ip)
         has_proxy, utls, rkn, ja4s_notes = await service_fuzzer(ip, open_ports, host, args)
         canned, rep, ss_drop = await j3_probes(ip, open_ports, host, args)
         sstp_hit = await sstp_probe(host, ip) if 443 in open_ports else False
+        fakedns_result = fakedns_leak_check(ip, open_ports)
+
+        tls_port = 443 if 443 in open_ports else (8443 if 8443 in open_ports else None)
+        if tls_port and not args.no_fronting:
+            fronting_result = await domain_fronting_check(ip, tls_port, host)
+        else:
+            fronting_result = {"fronting_possible": False}
+        if tls_port and not args.no_replay:
+            replay_result = await replay_probe(ip, tls_port, host)
+        else:
+            replay_result = {"verdict": "n/a"}
+        web_port = 80 if 80 in open_ports else tls_port
+        if web_port and args.slowloris:
+            slowloris_result = await slowloris_timing_probe(ip, web_port, host)
+        else:
+            slowloris_result = {"tested": False}
+
+    ptr_result = await ptr_cert_check(ip, host, open_ports)
+    pmtud_result = pmtud_probe(ip) if not args.no_pmtud else None
+    ttl_result = ttl_middlebox_check(ip, open_ports) if not args.no_ttl else {"tested": False}
 
     tspu_hop = run_trace(ip)
     snitch_signal = snitch_check(med, country) if med else None
@@ -924,9 +1545,21 @@ async def cmd_scan(host, args):
     if is_hosting: soft.append("Target IP is Hosting ASN.")
     if snitch_signal: soft.append("SNITCH: RTT/GeoIP mismatch.")
 
+    if fakedns_result.get("leak"): strong.append("FakeDNS leak: DNS-резолвер отдаёт приватный/fake-ip адрес.")
+    if fronting_result.get("fronting_possible"): soft.append("Domain fronting: сервер принял запрос с чужим SNI/Host.")
+    if replay_result.get("verdict") == "no_replay_protection_observed":
+        soft.append("TLS ClientHello replay: анти-replay защита не наблюдается.")
+    if ptr_result.get("mismatch"): soft.append("PTR/сертификат mismatch (generic хостинг-PTR).")
+    if pmtud_result and pmtud_result.get("encapsulated"): soft.append(f"PMTUD: MTU={pmtud_result['mtu']} ({pmtud_result['note']}).")
+    if ttl_result.get("flagged"): soft.append(f"TTL middlebox: diff={ttl_result.get('diff')} между открытым/закрытым портом.")
+    for a in bgp_result.get("anomalies", []):
+        soft.append(f"BGP: {a}")
+
     if tspu_hop: info.append("TSPU 10.X.Y.Z hop [Info only, no penalty].")
     for note in ja4s_notes:
         info.append(f"JA4S stack guess: {note}")
+    if slowloris_result.get("tested") and slowloris_result.get("closed_after_s") is not None:
+        info.append(f"Slowloris timing: сервер оборвал соединение через {slowloris_result['closed_after_s']}s.")
 
     score = 100
     if bgp_drop or rkn: score -= 40
@@ -962,6 +1595,21 @@ async def cmd_scan(host, args):
     report_data["verdict"] = {"score": score, "label": label, "strong": strong, "soft": soft, "info": info}
     report_data["tspu_verdict"] = {"tier": tspu_tier, "reason": tspu_reason}
     report_data["signals"] = strong + soft + info
+    report_data["pmtud"] = pmtud_result
+    report_data["bgp"] = bgp_result
+    report_data["ptr"] = ptr_result
+    report_data["fakedns"] = fakedns_result
+    report_data["fronting"] = fronting_result
+    report_data["slowloris"] = slowloris_result
+    report_data["replay"] = replay_result
+    report_data["ttl_middlebox"] = ttl_result
+
+    if args.compare:
+        compare_reports(args.compare, report_data)
+
+    if args.html:
+        html_path = args.html if isinstance(args.html, str) else f"{host.replace('/', '_')}_report.html"
+        generate_html_report(report_data, html_path)
 
     log.flush_save(host, json_export=args.json, save_file=args.save)
 
@@ -981,6 +1629,17 @@ async def main():
     p_scan.add_argument("--stealth", action="store_true")
     p_scan.add_argument("--passive", action="store_true")
     p_scan.add_argument("--j3-subset", type=int, choices=range(1, 9))
+    p_scan.add_argument("--html", nargs="?", const=True, default=False,
+                         help="сохранить HTML-отчёт (опционально: путь к файлу)")
+    p_scan.add_argument("--compare", metavar="OLD.json",
+                         help="сравнить текущий скан с прошлым JSON-отчётом (diff score/label/signals)")
+    p_scan.add_argument("--slowloris", action="store_true",
+                         help="включить Slowloris-style timing-пробу (одно соединение, +~12s к скану)")
+    p_scan.add_argument("--no-pmtud", action="store_true", help="пропустить PMTUD MTU-фингерпринт")
+    p_scan.add_argument("--no-bgp", action="store_true", help="пропустить BGP-анализ аномалий (RIPEstat)")
+    p_scan.add_argument("--no-ttl", action="store_true", help="пропустить TTL middlebox-детект")
+    p_scan.add_argument("--no-fronting", action="store_true", help="пропустить domain fronting проверку")
+    p_scan.add_argument("--no-replay", action="store_true", help="пропустить TLS ClientHello replay-симуляцию")
 
     p_dpi = sub.add_parser("dpi", help="SNI-RST Probe")
     p_dpi.add_argument("host")
